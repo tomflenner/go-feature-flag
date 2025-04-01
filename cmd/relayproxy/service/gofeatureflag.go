@@ -5,10 +5,13 @@ import (
 	"log/slog"
 	"time"
 
+	"dario.cat/mergo"
+	"github.com/IBM/sarama"
 	awsConf "github.com/aws/aws-sdk-go-v2/config"
 	slogzap "github.com/samber/slog-zap/v2"
 	ffclient "github.com/thomaspoignant/go-feature-flag"
 	"github.com/thomaspoignant/go-feature-flag/cmd/relayproxy/config"
+	"github.com/thomaspoignant/go-feature-flag/cmd/relayproxy/config/kafka"
 	"github.com/thomaspoignant/go-feature-flag/exporter"
 	"github.com/thomaspoignant/go-feature-flag/exporter/azureexporter"
 	"github.com/thomaspoignant/go-feature-flag/exporter/fileexporter"
@@ -26,20 +29,12 @@ import (
 	"github.com/thomaspoignant/go-feature-flag/notifier/slacknotifier"
 	"github.com/thomaspoignant/go-feature-flag/notifier/webhooknotifier"
 	"github.com/thomaspoignant/go-feature-flag/retriever"
-	"github.com/thomaspoignant/go-feature-flag/retriever/azblobstorageretriever"
-	"github.com/thomaspoignant/go-feature-flag/retriever/bitbucketretriever"
 	"github.com/thomaspoignant/go-feature-flag/retriever/fileretriever"
 	"github.com/thomaspoignant/go-feature-flag/retriever/gcstorageretriever"
-	"github.com/thomaspoignant/go-feature-flag/retriever/githubretriever"
-	"github.com/thomaspoignant/go-feature-flag/retriever/gitlabretriever"
-	"github.com/thomaspoignant/go-feature-flag/retriever/httpretriever"
-	"github.com/thomaspoignant/go-feature-flag/retriever/k8sretriever"
-	"github.com/thomaspoignant/go-feature-flag/retriever/mongodbretriever"
 	"github.com/thomaspoignant/go-feature-flag/retriever/redisretriever"
 	"github.com/thomaspoignant/go-feature-flag/retriever/s3retrieverv2"
 	"go.uber.org/zap"
 	"golang.org/x/net/context"
-	"k8s.io/client-go/rest"
 )
 
 func NewGoFeatureFlagClient(
@@ -47,38 +42,19 @@ func NewGoFeatureFlagClient(
 	logger *zap.Logger,
 	notifiers []notifier.Notifier,
 ) (*ffclient.GoFeatureFlag, error) {
-	var mainRetriever retriever.Retriever
 	var err error
-
 	if proxyConf == nil {
 		return nil, fmt.Errorf("proxy config is empty")
 	}
 
-	if proxyConf.Retriever != nil {
-		mainRetriever, err = initRetriever(proxyConf.Retriever)
-		if err != nil {
-			return nil, err
-		}
+	retrievers, err := initRetrievers(proxyConf)
+	if err != nil {
+		return nil, err
 	}
 
-	// Manage if we have more than 1 retriever
-	retrievers := make([]retriever.Retriever, 0)
-	if proxyConf.Retrievers != nil {
-		for _, r := range *proxyConf.Retrievers {
-			currentRetriever, err := initRetriever(&r)
-			if err != nil {
-				return nil, err
-			}
-			retrievers = append(retrievers, currentRetriever)
-		}
-	}
-
-	var exp ffclient.DataExporter
-	if proxyConf.Exporter != nil {
-		exp, err = initDataExporter(proxyConf.Exporter)
-		if err != nil {
-			return nil, err
-		}
+	exporters, err := initDataExporters(proxyConf)
+	if err != nil {
+		return nil, err
 	}
 
 	notif, err := initNotifier(proxyConf.Notifiers)
@@ -88,14 +64,17 @@ func NewGoFeatureFlagClient(
 	notif = append(notif, notifiers...)
 
 	f := ffclient.Config{
-		PollingInterval:                 time.Duration(proxyConf.PollingInterval) * time.Millisecond,
-		LeveledLogger:                   slog.New(slogzap.Option{Level: slog.LevelDebug, Logger: logger}.NewZapHandler()),
+		PollingInterval: time.Duration(
+			proxyConf.PollingInterval,
+		) * time.Millisecond,
+		LeveledLogger: slog.New(
+			slogzap.Option{Level: slog.LevelDebug, Logger: logger}.NewZapHandler(),
+		),
 		Context:                         context.Background(),
-		Retriever:                       mainRetriever,
 		Retrievers:                      retrievers,
 		Notifiers:                       notif,
 		FileFormat:                      proxyConf.FileFormat,
-		DataExporter:                    exp,
+		DataExporters:                   exporters,
 		StartWithRetrieverError:         proxyConf.StartWithRetrieverError,
 		EnablePollingJitter:             proxyConf.EnablePollingJitter,
 		DisableNotifierOnInit:           proxyConf.DisableNotifierOnInit,
@@ -106,98 +85,86 @@ func NewGoFeatureFlagClient(
 	return ffclient.New(f)
 }
 
+// initRetrievers initialize the retrievers based on the configuration
+// it handles both the `retriever` and `retrievers` fields
+func initRetrievers(proxyConf *config.Config) ([]retriever.Retriever, error) {
+	retrievers := make([]retriever.Retriever, 0)
+	if proxyConf.Retriever != nil {
+		currentRetriever, err := initRetriever(proxyConf.Retriever)
+		if err != nil {
+			return nil, err
+		}
+		retrievers = append(retrievers, currentRetriever)
+	}
+	if proxyConf.Retrievers != nil {
+		for _, r := range *proxyConf.Retrievers {
+			currentRetriever, err := initRetriever(&r)
+			if err != nil {
+				return nil, err
+			}
+			retrievers = append(retrievers, currentRetriever)
+		}
+	}
+	return retrievers, nil
+}
+
 // initRetriever initialize the retriever based on the configuration
 func initRetriever(c *config.RetrieverConf) (retriever.Retriever, error) {
 	retrieverTimeout := config.DefaultRetriever.Timeout
 	if c.Timeout != 0 {
 		retrieverTimeout = time.Duration(c.Timeout) * time.Millisecond
 	}
-
-	// Conversions
 	switch c.Kind {
 	case config.GitHubRetriever:
-		token := c.AuthToken
-		if token == "" && c.GithubToken != "" { // nolint: staticcheck
-			token = c.GithubToken // nolint: staticcheck
-		}
-		return &githubretriever.Retriever{
-			RepositorySlug: c.RepositorySlug,
-			Branch: func() string {
-				if c.Branch == "" {
-					return config.DefaultRetriever.GitBranch
-				}
-				return c.Branch
-			}(),
-			FilePath:    c.Path,
-			GithubToken: token,
-			Timeout:     retrieverTimeout,
-		}, nil
+		return initGithubRetriever(c, retrieverTimeout), nil
 	case config.GitlabRetriever:
-		return &gitlabretriever.Retriever{
-			BaseURL: c.BaseURL,
-			Branch: func() string {
-				if c.Branch == "" {
-					return config.DefaultRetriever.GitBranch
-				}
-				return c.Branch
-			}(),
-			FilePath:       c.Path,
-			GitlabToken:    c.AuthToken,
-			RepositorySlug: c.RepositorySlug,
-			Timeout:        retrieverTimeout,
-		}, nil
+		return initGitlabRetriever(c, retrieverTimeout), nil
 	case config.BitbucketRetriever:
-		return &bitbucketretriever.Retriever{
-			RepositorySlug: c.RepositorySlug,
-			Branch: func() string {
-				if c.Branch == "" {
-					return config.DefaultRetriever.GitBranch
-				}
-				return c.Branch
-			}(),
-			FilePath:       c.Path,
-			BitBucketToken: c.AuthToken,
-			BaseURL:        c.BaseURL,
-			Timeout:        retrieverTimeout,
-		}, nil
+		return initBitbucketRetriever(c, retrieverTimeout), nil
 	case config.FileRetriever:
 		return &fileretriever.Retriever{Path: c.Path}, nil
 	case config.S3Retriever:
 		awsConfig, err := awsConf.LoadDefaultConfig(context.Background())
 		return &s3retrieverv2.Retriever{Bucket: c.Bucket, Item: c.Item, AwsConfig: &awsConfig}, err
 	case config.HTTPRetriever:
-		return &httpretriever.Retriever{
-			URL: c.URL,
-			Method: func() string {
-				if c.HTTPMethod == "" {
-					return config.DefaultRetriever.HTTPMethod
-				}
-				return c.HTTPMethod
-			}(), Body: c.HTTPBody, Header: c.HTTPHeaders, Timeout: retrieverTimeout}, nil
+		return initHTTPRetriever(c, retrieverTimeout), nil
 	case config.GoogleStorageRetriever:
 		return &gcstorageretriever.Retriever{Bucket: c.Bucket, Object: c.Object}, nil
 	case config.KubernetesRetriever:
-		client, err := rest.InClusterConfig()
-		if err != nil {
-			return nil, err
-		}
-		return &k8sretriever.Retriever{Namespace: c.Namespace, ConfigMapName: c.ConfigMap, Key: c.Key,
-			ClientConfig: *client}, nil
+		return initK8sRetriever(c)
 	case config.MongoDBRetriever:
-		return &mongodbretriever.Retriever{Database: c.Database, URI: c.URI, Collection: c.Collection}, nil
+		return initMongoRetriever(c), nil
 	case config.RedisRetriever:
 		return &redisretriever.Retriever{Options: c.RedisOptions, Prefix: c.RedisPrefix}, nil
 	case config.AzBlobStorageRetriever:
-		return &azblobretriever.Retriever{
-			Container:   c.Container,
-			Object:      c.Object,
-			AccountName: c.AccountName,
-			AccountKey:  c.AccountKey,
-		}, nil
+		return initAzBlobRetriever(c), nil
 	default:
 		return nil, fmt.Errorf("invalid retriever: kind \"%s\" "+
 			"is not supported", c.Kind)
 	}
+}
+
+// initDataExporters initialize the exporters based on the configuration
+// it handles both the `exporter` and `exporters` fields.
+func initDataExporters(proxyConf *config.Config) ([]ffclient.DataExporter, error) {
+	exporters := make([]ffclient.DataExporter, 0)
+	if proxyConf.Exporter != nil {
+		exp, err := initDataExporter(proxyConf.Exporter)
+		if err != nil {
+			return nil, err
+		}
+		exporters = append(exporters, exp)
+	}
+	if proxyConf.Exporters != nil {
+		for _, e := range *proxyConf.Exporters {
+			currentExporter, err := initDataExporter(&e)
+			if err != nil {
+				return nil, err
+			}
+			exporters = append(exporters, currentExporter)
+		}
+	}
+	return exporters, nil
 }
 
 func initDataExporter(c *config.ExporterConf) (ffclient.DataExporter, error) {
@@ -319,9 +286,13 @@ func createExporter(c *config.ExporterConf) (exporter.CommonExporter, error) {
 			AwsConfig: &awsConfig,
 		}, nil
 	case config.KafkaExporter:
+		settings, err := setKafkaConfig(c.Kafka)
+		if err != nil {
+			return nil, err
+		}
 		return &kafkaexporter.Exporter{
 			Format:   format,
-			Settings: c.Kafka,
+			Settings: settings,
 		}, nil
 	case config.PubSubExporter:
 		return &pubsubexporter.Exporter{
@@ -344,6 +315,32 @@ func createExporter(c *config.ExporterConf) (exporter.CommonExporter, error) {
 	}
 }
 
+// setKafkaConfig set the kafka configuration based on the default configuration
+// it will initialize the default configuration and merge it with the changes from the user.
+func setKafkaConfig(k kafkaexporter.Settings) (kafkaexporter.Settings, error) {
+	if k.Config == nil {
+		return k, nil
+	}
+
+	defaultConfig := sarama.NewConfig()
+	err := mergo.Merge(k.Config, defaultConfig)
+	if err != nil {
+		return kafkaexporter.Settings{}, err
+	}
+
+	switch k.Net.SASL.Mechanism {
+	case sarama.SASLTypeSCRAMSHA256:
+		k.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient {
+			return &kafka.XDGSCRAMClient{HashGeneratorFcn: kafka.SHA256}
+		}
+	case sarama.SASLTypeSCRAMSHA512:
+		k.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient {
+			return &kafka.XDGSCRAMClient{HashGeneratorFcn: kafka.SHA512}
+		}
+	}
+	return k, nil
+}
+
 func initNotifier(c []config.NotifierConf) ([]notifier.Notifier, error) {
 	if c == nil {
 		return nil, nil
@@ -357,7 +354,10 @@ func initNotifier(c []config.NotifierConf) ([]notifier.Notifier, error) {
 				zap.L().Warn("slackWebhookURL field is deprecated, please use webhookURL instead")
 				cNotif.WebhookURL = cNotif.SlackWebhookURL // nolint
 			}
-			notifiers = append(notifiers, &slacknotifier.Notifier{SlackWebhookURL: cNotif.WebhookURL})
+			notifiers = append(
+				notifiers,
+				&slacknotifier.Notifier{SlackWebhookURL: cNotif.WebhookURL},
+			)
 		case config.MicrosoftTeamsNotifier:
 			notifiers = append(
 				notifiers,
@@ -375,7 +375,10 @@ func initNotifier(c []config.NotifierConf) ([]notifier.Notifier, error) {
 				},
 			)
 		case config.DiscordNotifier:
-			notifiers = append(notifiers, &discordnotifier.Notifier{DiscordWebhookURL: cNotif.WebhookURL})
+			notifiers = append(
+				notifiers,
+				&discordnotifier.Notifier{DiscordWebhookURL: cNotif.WebhookURL},
+			)
 		default:
 			return nil, fmt.Errorf("invalid notifier: kind \"%s\" is not supported", cNotif.Kind)
 		}

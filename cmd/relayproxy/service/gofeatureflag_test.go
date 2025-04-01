@@ -1,11 +1,14 @@
 package service
 
 import (
+	"crypto/tls"
 	"fmt"
+	"net"
 	"net/http"
 	"testing"
 	"time"
 
+	"github.com/IBM/sarama"
 	"github.com/stretchr/testify/assert"
 	ffclient "github.com/thomaspoignant/go-feature-flag"
 	"github.com/thomaspoignant/go-feature-flag/cmd/relayproxy/config"
@@ -35,6 +38,7 @@ import (
 	"github.com/thomaspoignant/go-feature-flag/retriever/s3retrieverv2"
 	"github.com/xitongsys/parquet-go/parquet"
 	"go.uber.org/zap"
+	"golang.org/x/net/proxy"
 )
 
 func Test_initRetriever(t *testing.T) {
@@ -236,6 +240,206 @@ func Test_initRetriever(t *testing.T) {
 				if !tt.skipCompleteValidation {
 					assert.Equal(t, tt.want, got)
 				}
+			}
+		})
+	}
+}
+func Test_initRetrievers(t *testing.T) {
+	tests := []struct {
+		name       string
+		retrievers *[]config.RetrieverConf
+		retriever  *config.RetrieverConf
+		wantErr    assert.ErrorAssertionFunc
+	}{
+		{
+			name:    "both retriever and retrievers",
+			wantErr: assert.NoError,
+			retrievers: &[]config.RetrieverConf{
+				{
+					Kind:           "bitbucket",
+					Branch:         "develop",
+					RepositorySlug: "gofeatureflag/config-repo",
+					Path:           "flags/config.goff.yaml",
+					AuthToken:      "XXX_BITBUCKET_TOKEN",
+					BaseURL:        "https://api.bitbucket.goff.org",
+				},
+			},
+			retriever: &config.RetrieverConf{
+				Kind:           "bitbucket",
+				Branch:         "main",
+				RepositorySlug: "gofeatureflag/config-repo",
+				Path:           "flags/config.goff.yaml",
+				AuthToken:      "XXX_BITBUCKET_TOKEN",
+				BaseURL:        "https://api.bitbucket.goff.org",
+			},
+		},
+		{
+			name:    "should error with invalid retriever",
+			wantErr: assert.Error,
+			retrievers: &[]config.RetrieverConf{
+				{
+					Kind:           "bitbucket",
+					Branch:         "develop",
+					RepositorySlug: "gofeatureflag/config-repo",
+					Path:           "flags/config.goff.yaml",
+					AuthToken:      "XXX_BITBUCKET_TOKEN",
+					BaseURL:        "https://api.bitbucket.goff.org",
+				},
+			},
+			retriever: &config.RetrieverConf{
+				Kind: "unknown",
+			},
+		},
+		{
+			name:    "should error with invalid retriever",
+			wantErr: assert.Error,
+			retrievers: &[]config.RetrieverConf{
+				{
+					Kind: "unknown",
+				},
+			},
+		},
+		{
+			name:    "only retriever",
+			wantErr: assert.NoError,
+			retriever: &config.RetrieverConf{
+				Kind:           "bitbucket",
+				Branch:         "main",
+				RepositorySlug: "gofeatureflag/config-repo",
+				Path:           "flags/config.goff.yaml",
+				AuthToken:      "XXX_BITBUCKET_TOKEN",
+				BaseURL:        "https://api.bitbucket.goff.org",
+			},
+		},
+		{
+			name:    "only retrievers",
+			wantErr: assert.NoError,
+			retrievers: &[]config.RetrieverConf{
+				{
+					Kind:           "bitbucket",
+					Branch:         "develop",
+					RepositorySlug: "gofeatureflag/config-repo",
+					Path:           "flags/config.goff.yaml",
+					AuthToken:      "XXX_BITBUCKET_TOKEN",
+					BaseURL:        "https://api.bitbucket.goff.org",
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			proxyConf := config.Config{
+				Retrievers: tt.retrievers,
+				Retriever:  tt.retriever,
+			}
+			r, err := initRetrievers(&proxyConf)
+			tt.wantErr(t, err)
+			if r != nil {
+				nbRetriever := 0
+				if tt.retrievers != nil {
+					nbRetriever += len(*tt.retrievers)
+				}
+				if tt.retriever != nil {
+					nbRetriever++
+				}
+				assert.Len(t, r, nbRetriever)
+			}
+		})
+	}
+}
+
+func Test_initExporters(t *testing.T) {
+	tests := []struct {
+		name      string
+		exporters *[]config.ExporterConf
+		exporter  *config.ExporterConf
+		wantErr   assert.ErrorAssertionFunc
+	}{
+		{
+			name:    "both exporter and exporters",
+			wantErr: assert.NoError,
+			exporter: &config.ExporterConf{
+				Kind:        "webhook",
+				EndpointURL: "https://gofeatureflag.org/webhook-example",
+				Secret:      "1234",
+			},
+			exporters: &[]config.ExporterConf{
+				{
+					Kind:        "webhook",
+					EndpointURL: "https://gofeatureflag.org/webhook-example",
+					Secret:      "1234",
+				},
+			},
+		},
+		{
+			name:    "exporter only",
+			wantErr: assert.NoError,
+			exporter: &config.ExporterConf{
+				Kind:        "webhook",
+				EndpointURL: "https://gofeatureflag.org/webhook-example",
+				Secret:      "1234",
+			},
+		},
+		{
+			name:    "exporters only",
+			wantErr: assert.NoError,
+			exporters: &[]config.ExporterConf{
+				{
+					Kind:        "webhook",
+					EndpointURL: "https://gofeatureflag.org/webhook-example",
+					Secret:      "1234",
+				},
+			},
+		},
+		{
+			name:    "invalid exporter",
+			wantErr: assert.Error,
+			exporter: &config.ExporterConf{
+				Kind: "invalid",
+			},
+			exporters: &[]config.ExporterConf{
+				{
+					Kind:        "webhook",
+					EndpointURL: "https://gofeatureflag.org/webhook-example",
+					Secret:      "1234",
+				},
+			},
+		},
+		{
+			name:    "invalid exporters",
+			wantErr: assert.Error,
+			exporter: &config.ExporterConf{
+
+				Kind:        "webhook",
+				EndpointURL: "https://gofeatureflag.org/webhook-example",
+				Secret:      "1234",
+			},
+			exporters: &[]config.ExporterConf{
+				{
+					Kind: "invalid",
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			proxyConf := config.Config{
+				Exporters: tt.exporters,
+				Exporter:  tt.exporter,
+			}
+			r, err := initDataExporters(&proxyConf)
+			tt.wantErr(t, err)
+			if r != nil {
+				nbExp := 0
+				if tt.exporters != nil {
+					nbExp += len(*tt.exporters)
+				}
+				if tt.exporter != nil {
+					nbExp++
+				}
+				assert.Len(t, r, nbExp)
 			}
 		})
 	}
@@ -535,5 +739,276 @@ func TestNewGoFeatureFlagClient_ProxyConfNil(t *testing.T) {
 
 	// Assert that the function returns nil and an error
 	assert.Nil(t, goff, "Expected GoFeatureFlag client to be nil when proxyConf is nil")
-	assert.EqualError(t, err, "proxy config is empty", "Expected error message to indicate empty proxy config")
+	assert.EqualError(
+		t,
+		err,
+		"proxy config is empty",
+		"Expected error message to indicate empty proxy config",
+	)
+}
+
+func TestSetKafkaConfig(t *testing.T) {
+	t.Run(
+		"should have a SCRAMClientGeneratorFunc if SCRAM is enabled and use SCRAM-SHA-512 mechanism",
+		func(t *testing.T) {
+			settings := kafkaexporter.Settings{
+				Topic:     "my-kafka-topic",
+				Addresses: []string{"addr1", "addr2"},
+				Config: &sarama.Config{
+					Net: struct {
+						MaxOpenRequests                  int
+						DialTimeout                      time.Duration
+						ReadTimeout                      time.Duration
+						WriteTimeout                     time.Duration
+						ResolveCanonicalBootstrapServers bool
+						TLS                              struct {
+							Enable bool
+							Config *tls.Config
+						}
+						SASL struct {
+							Enable                   bool
+							Mechanism                sarama.SASLMechanism
+							Version                  int16
+							Handshake                bool
+							AuthIdentity             string
+							User                     string
+							Password                 string
+							SCRAMAuthzID             string
+							SCRAMClientGeneratorFunc func() sarama.SCRAMClient
+							TokenProvider            sarama.AccessTokenProvider
+							GSSAPI                   sarama.GSSAPIConfig
+						}
+						KeepAlive time.Duration
+						LocalAddr net.Addr
+						Proxy     struct {
+							Enable bool
+							Dialer proxy.Dialer
+						}
+					}{SASL: struct {
+						Enable                   bool
+						Mechanism                sarama.SASLMechanism
+						Version                  int16
+						Handshake                bool
+						AuthIdentity             string
+						User                     string
+						Password                 string
+						SCRAMAuthzID             string
+						SCRAMClientGeneratorFunc func() sarama.SCRAMClient
+						TokenProvider            sarama.AccessTokenProvider
+						GSSAPI                   sarama.GSSAPIConfig
+					}{Enable: true, Mechanism: "SCRAM-SHA-512", User: "TODO", Password: "TODO"}},
+				},
+			}
+			kafkaConfig, err := setKafkaConfig(settings)
+			assert.NoError(t, err)
+
+			assert.NotNil(t, kafkaConfig.Net.SASL.SCRAMClientGeneratorFunc)
+		},
+	)
+
+	t.Run(
+		"should have a SCRAMClientGeneratorFunc if SCRAM is enabled and use SCRAM-SHA-256 mechanism",
+		func(t *testing.T) {
+			settings := kafkaexporter.Settings{
+				Topic:     "my-kafka-topic",
+				Addresses: []string{"addr1", "addr2"},
+				Config: &sarama.Config{
+					Net: struct {
+						MaxOpenRequests                  int
+						DialTimeout                      time.Duration
+						ReadTimeout                      time.Duration
+						WriteTimeout                     time.Duration
+						ResolveCanonicalBootstrapServers bool
+						TLS                              struct {
+							Enable bool
+							Config *tls.Config
+						}
+						SASL struct {
+							Enable                   bool
+							Mechanism                sarama.SASLMechanism
+							Version                  int16
+							Handshake                bool
+							AuthIdentity             string
+							User                     string
+							Password                 string
+							SCRAMAuthzID             string
+							SCRAMClientGeneratorFunc func() sarama.SCRAMClient
+							TokenProvider            sarama.AccessTokenProvider
+							GSSAPI                   sarama.GSSAPIConfig
+						}
+						KeepAlive time.Duration
+						LocalAddr net.Addr
+						Proxy     struct {
+							Enable bool
+							Dialer proxy.Dialer
+						}
+					}{SASL: struct {
+						Enable                   bool
+						Mechanism                sarama.SASLMechanism
+						Version                  int16
+						Handshake                bool
+						AuthIdentity             string
+						User                     string
+						Password                 string
+						SCRAMAuthzID             string
+						SCRAMClientGeneratorFunc func() sarama.SCRAMClient
+						TokenProvider            sarama.AccessTokenProvider
+						GSSAPI                   sarama.GSSAPIConfig
+					}{Enable: true, Mechanism: "SCRAM-SHA-256", User: "TODO", Password: "TODO"}},
+				},
+			}
+			kafkaConfig, err := setKafkaConfig(settings)
+			assert.NoError(t, err)
+
+			assert.NotNil(t, kafkaConfig.Net.SASL.SCRAMClientGeneratorFunc)
+		},
+	)
+
+	t.Run(
+		"should not have a SCRAMClientGeneratorFunc if SCRAM is enabled and use an unknown mechanism",
+		func(t *testing.T) {
+			settings := kafkaexporter.Settings{
+				Topic:     "my-kafka-topic",
+				Addresses: []string{"addr1", "addr2"},
+				Config: &sarama.Config{
+					Net: struct {
+						MaxOpenRequests                  int
+						DialTimeout                      time.Duration
+						ReadTimeout                      time.Duration
+						WriteTimeout                     time.Duration
+						ResolveCanonicalBootstrapServers bool
+						TLS                              struct {
+							Enable bool
+							Config *tls.Config
+						}
+						SASL struct {
+							Enable                   bool
+							Mechanism                sarama.SASLMechanism
+							Version                  int16
+							Handshake                bool
+							AuthIdentity             string
+							User                     string
+							Password                 string
+							SCRAMAuthzID             string
+							SCRAMClientGeneratorFunc func() sarama.SCRAMClient
+							TokenProvider            sarama.AccessTokenProvider
+							GSSAPI                   sarama.GSSAPIConfig
+						}
+						KeepAlive time.Duration
+						LocalAddr net.Addr
+						Proxy     struct {
+							Enable bool
+							Dialer proxy.Dialer
+						}
+					}{SASL: struct {
+						Enable                   bool
+						Mechanism                sarama.SASLMechanism
+						Version                  int16
+						Handshake                bool
+						AuthIdentity             string
+						User                     string
+						Password                 string
+						SCRAMAuthzID             string
+						SCRAMClientGeneratorFunc func() sarama.SCRAMClient
+						TokenProvider            sarama.AccessTokenProvider
+						GSSAPI                   sarama.GSSAPIConfig
+					}{Enable: true, Mechanism: "UNKNONW-MECHANISM", User: "TODO", Password: "TODO"}},
+				},
+			}
+			kafkaConfig, err := setKafkaConfig(settings)
+			assert.NoError(t, err)
+			assert.Nil(t, kafkaConfig.Net.SASL.SCRAMClientGeneratorFunc)
+		},
+	)
+
+	t.Run("should return a valid sarama.Config if settings are nil", func(t *testing.T) {
+		settings := kafkaexporter.Settings{
+			Topic:     "my-kafka-topic",
+			Addresses: []string{"addr1", "addr2"},
+			Config: &sarama.Config{
+				Version: sarama.V2_1_0_0,
+			},
+		}
+		// We expect am error because the settings are nil
+		assert.Error(t, settings.Config.Validate())
+
+		kafkaConfig, err := setKafkaConfig(settings)
+		assert.NoError(t, err)
+
+		// after calling setKafkaConfig, the settings should be valid because they are merged with the default config.
+		assert.NoError(t, kafkaConfig.Config.Validate())
+	})
+
+	t.Run("should return a valid sarama.Config with specific settings set and value should be"+
+		" merged with default kafka config", func(t *testing.T) {
+		settings := kafkaexporter.Settings{
+			Topic:     "my-kafka-topic",
+			Addresses: []string{"addr1", "addr2"},
+			Config: &sarama.Config{
+				Net: struct {
+					MaxOpenRequests                  int
+					DialTimeout                      time.Duration
+					ReadTimeout                      time.Duration
+					WriteTimeout                     time.Duration
+					ResolveCanonicalBootstrapServers bool
+					TLS                              struct {
+						Enable bool
+						Config *tls.Config
+					}
+					SASL struct {
+						Enable                   bool
+						Mechanism                sarama.SASLMechanism
+						Version                  int16
+						Handshake                bool
+						AuthIdentity             string
+						User                     string
+						Password                 string
+						SCRAMAuthzID             string
+						SCRAMClientGeneratorFunc func() sarama.SCRAMClient
+						TokenProvider            sarama.AccessTokenProvider
+						GSSAPI                   sarama.GSSAPIConfig
+					}
+					KeepAlive time.Duration
+					LocalAddr net.Addr
+					Proxy     struct {
+						Enable bool
+						Dialer proxy.Dialer
+					}
+				}{SASL: struct {
+					Enable                   bool
+					Mechanism                sarama.SASLMechanism
+					Version                  int16
+					Handshake                bool
+					AuthIdentity             string
+					User                     string
+					Password                 string
+					SCRAMAuthzID             string
+					SCRAMClientGeneratorFunc func() sarama.SCRAMClient
+					TokenProvider            sarama.AccessTokenProvider
+					GSSAPI                   sarama.GSSAPIConfig
+				}{Enable: true, Mechanism: "SCRAM-SHA-512", User: "TODO", Password: "TODO"}},
+			},
+		}
+		// We expect am error because the settings are nil
+		assert.Error(t, settings.Config.Validate())
+
+		kafkaConfig, err := setKafkaConfig(settings)
+		assert.NoError(t, err)
+
+		// after calling setKafkaConfig, the settings should be valid because they are merged with the default config.
+		assert.NoError(t, kafkaConfig.Config.Validate())
+		assert.Equal(t, true, settings.Config.Net.SASL.Enable)
+		assert.Equal(t, "TODO", settings.Config.Net.SASL.User)
+		assert.Equal(t, "TODO", settings.Config.Net.SASL.Password)
+	})
+
+	t.Run("should return a nil config", func(t *testing.T) {
+		settings := kafkaexporter.Settings{
+			Topic:     "my-kafka-topic",
+			Addresses: []string{"addr1", "addr2"},
+		}
+		kafkaConfig, err := setKafkaConfig(settings)
+		assert.NoError(t, err)
+		assert.Nil(t, kafkaConfig.Config)
+	})
 }

@@ -36,7 +36,11 @@ type Retriever struct {
 	status     retriever.Status
 }
 
+// Init is initializing the retriever to start fetching the flags configuration.
 func (s *Retriever) Init(ctx context.Context, _ *fflog.FFLogger) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	s.status = retriever.RetrieverNotReady
 	if s.downloader == nil {
 		if s.AwsConfig == nil {
@@ -53,16 +57,24 @@ func (s *Retriever) Init(ctx context.Context, _ *fflog.FFLogger) error {
 	s.status = retriever.RetrieverReady
 	return nil
 }
+
+// Shutdown gracefully shutdown the provider and set the status as not ready.
 func (s *Retriever) Shutdown(_ context.Context) error {
 	s.status = retriever.RetrieverNotReady
 	s.downloader = nil
 	return nil
 }
+
+// Status is the function returning the internal state of the retriever.
 func (s *Retriever) Status() retriever.Status {
 	return s.status
 }
 
+// Retrieve is the function in charge of fetching the flag configuration.
 func (s *Retriever) Retrieve(ctx context.Context) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if s.downloader == nil {
 		s.status = retriever.RetrieverError
 		return nil, fmt.Errorf("downloader is not initialized")
